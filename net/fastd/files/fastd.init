@@ -75,8 +75,13 @@ start_instance() {
 
 	config_get secret "$s" secret
 	if [ -z "$secret" ]; then
-		error "$s: secret is not set"
-		return 1
+		/etc/init.d/haveged start
+		secret=`fastd --generate-key --machine-readable`
+		/etc/init.d/haveged stop
+uci -q batch <<EOF
+set fastd.$s.secret=$secret
+commit fastd
+EOF
 	fi
 
 	append_opts_list "$s" config config_peer_dir bind method
