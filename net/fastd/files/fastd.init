@@ -1,14 +1,14 @@
 #!/bin/sh /etc/rc.common
-# Copyright (C) 2012 OpenWrt.org
+# Copyright (C) 2012-2013 OpenWrt.org
 
 START=95
 
-EXTRA_COMMANDS="up down show_key"
+EXTRA_COMMANDS="up down show_key generate_key"
 
 LIST_SEP="
 "
 TMP_FASTD=/tmp/fastd
-FASTD_COMMAND=/usr/sbin/fastd
+FASTD_COMMAND=/usr/bin/fastd
 
 append_opt() {
 	local v="$1"; local p="$2"
@@ -34,7 +34,7 @@ append_opts_bool() {
 	local p; local v; local s="$1"; shift
 	for p in $*; do
 		config_get_bool v "$s" "$p" 0
-		[ "$v" == 1 ] && append_opt_bool "$p"
+		[ "$v" = 1 ] && append_opt_bool "$p"
 	done
 }
 
@@ -52,6 +52,110 @@ section_enabled() {
 
 error() {
 	echo "${initscript}:" "$@" 1>&2
+}
+
+create_peer_config() {
+	local s="$2"; local peer="$1"
+
+	config_get net "$peer" net
+	[ "$net" == "$s" ] || return 0
+
+	section_enabled "$peer" || return 0
+
+	config_get key "$peer" key
+	config_get address "$peer" address
+	config_get hostname "$peer" hostname
+	config_get address_family "$peer" address_family
+	config_get port "$peer" port
+	config_get_bool float "$peer" float 0
+
+	if [ -z "$key" ]; then
+		error "peer $peer: key is not set"
+		return 1
+	fi
+
+	local remote=''
+	if [ "$address" -o "$hostname" ]; then
+		if [ "$address" -a "$hostname" ]; then
+			error "peer $peer: both address and hostname given"
+			return 1
+		fi
+
+		if [ "$float" = 0 ]; then
+			float=''
+		else
+			float='float'
+		fi
+
+		if [ "$port" ]; then
+			if [ "$address" ]; then
+				remote="remote $address port $port $float;"
+			else # $hostname
+				if [ "$address_family" -a "$address_family" != 'ipv4' -a "$address_family" != 'ipv6' ]; then
+					error "peer $peer: invalid address family given"
+					return 1
+				fi
+				remote="remote $address_family \"$hostname\" port $port $float;"
+			fi
+		else
+			error "peer $peer: address or hostname, but no port given"
+			return 1
+		fi
+	fi
+
+	cat > "$TMP_FASTD/fastd.$s.peers/$peer" <<EOF
+key "$key";
+$remote
+EOF
+}
+
+update_peers_instance() {
+	local s="$1"
+
+	rm -rf "$TMP_FASTD/fastd.$s.peers"
+	mkdir -p "$TMP_FASTD/fastd.$s.peers"
+
+	config_foreach create_peer_config 'peer' "$s"
+}
+
+get_key_instance() {
+	local s="$1"
+
+	config_get secret "$s" secret
+	if [ "$secret" = 'generate' ]; then
+		secret=`fastd --generate-key --machine-readable`
+		uci -q set fastd."$s".secret="$secret" && uci -q commit fastd
+	fi
+
+	echo "$secret"
+}
+
+generate_key_instance() {
+	local s="$1"
+
+	config_get secret "$s" secret
+	if [ -z "$secret" -o "$secret" = 'generate' ]; then
+		secret=`fastd --generate-key --machine-readable`
+		uci -q set fastd."$s".secret="$secret" && uci -q commit fastd
+	fi
+
+	"$FASTD_COMMAND" --config - --show-key --machine-readable <<EOF
+secret "$secret";
+EOF
+}
+
+show_key_instance() {
+	local s="$1"
+
+	local secret=`get_key_instance "$s"`
+	if [ -z "$secret" ]; then
+		error "$s: secret is not set"
+		return 1
+	fi
+
+	"$FASTD_COMMAND" --config - --show-key --machine-readable <<EOF
+secret "$secret";
+EOF
 }
 
 start_instance() {
@@ -73,7 +177,7 @@ start_instance() {
 		return 1
 	fi
 
-	config_get secret "$s" secret
+	local secret=`get_key_instance "$s"`
 	if [ -z "$secret" ]; then
 		/etc/init.d/haveged start
 		secret=`fastd --generate-key --machine-readable`
@@ -88,10 +192,11 @@ EOF
 	append_opts "$s" syslog_level mode interface mtu
 	append_opts_bool "$s" forward
 
-	mkdir -p "$TMP_FASTD"
-	echo "secret \"$secret\";" > "$TMP_FASTD/secret.$s.conf"
+	update_peers_instance "$s"
 
-	eval service_start "'$FASTD_COMMAND'" --daemon --pid-file "'$SERVICE_PID_FILE'" --syslog-level info $OPTS --config "'$TMP_FASTD/secret.$s.conf'"
+	eval service_start "'$FASTD_COMMAND'" --daemon --pid-file "'$SERVICE_PID_FILE'" --syslog-level info $OPTS --config-peer-dir "$TMP_FASTD/fastd.$s.peers" --config - <<EOF
+secret "$secret";
+EOF
 
 	if ! ifconfig "$interface" >/dev/null 2>&1; then
 		error "$s: startup failed"
@@ -125,28 +230,15 @@ stop_instance() {
 
 	service_stop "$FASTD_COMMAND"
 
-	rm -f "$TMP_FASTD/secret.$s.conf"
-}
-
-show_key_instance() {
-	local s="$1"
-
-	config_get secret "$s" secret
-	if [ -z "$secret" ]; then
-		error "$s: secret is not set"
-		return 1
-	fi
-
-	mkdir -p "$TMP_FASTD"
-	echo "secret \"$secret\";" > "$TMP_FASTD/secret.$s.conf"
-
-	"$FASTD_COMMAND" --config "$TMP_FASTD/secret.$s.conf" --show-key --machine-readable
+	rm -rf "$TMP_FASTD/fastd.$s.peers"
 }
 
 reload_instance() {
         local s="$1"
 
         section_enabled "$s" || return 1
+
+	update_peers_instance "$s"
 
         SERVICE_PID_FILE="/var/run/fastd.$s.pid"
         service_reload "$FASTD_COMMAND"
@@ -173,7 +265,7 @@ up() {
 	config_load 'fastd'
 	for instance in "$@"; do
 		config_get exists "$instance" 'TYPE'
-		if [ "$exists" == "fastd" ]; then
+		if [ "$exists" = 'fastd' ]; then
 			start_instance "$instance"
 		fi
 	done
@@ -185,7 +277,7 @@ down() {
 	config_load 'fastd'
 	for instance in "$@"; do
 		config_get exists "$instance" 'TYPE'
-		if [ "$exists" == "fastd" ]; then
+		if [ "$exists" = 'fastd' ]; then
 			stop_instance "$instance"
 		fi
 	done
@@ -197,8 +289,20 @@ show_key() {
 	config_load 'fastd'
 	for instance in "$@"; do
 		config_get exists "$instance" 'TYPE'
-		if [ "$exists" == "fastd" ]; then
+		if [ "$exists" = 'fastd' ]; then
 			show_key_instance "$instance"
+		fi
+	done
+}
+
+generate_key() {
+	local exists
+	local instance
+	config_load 'fastd'
+	for instance in "$@"; do
+		config_get exists "$instance" 'TYPE'
+		if [ "$exists" = 'fastd' ]; then
+			generate_key_instance "$instance"
 		fi
 	done
 }
