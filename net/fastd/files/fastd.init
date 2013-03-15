@@ -123,8 +123,10 @@ get_key_instance() {
 
 	config_get secret "$s" secret
 	if [ "$secret" = 'generate' ]; then
+		/etc/init.d/haveged start
 		secret=`fastd --generate-key --machine-readable`
 		uci -q set fastd."$s".secret="$secret" && uci -q commit fastd
+		/etc/init.d/haveged stop
 	fi
 
 	echo "$secret"
@@ -179,13 +181,8 @@ start_instance() {
 
 	local secret=`get_key_instance "$s"`
 	if [ -z "$secret" ]; then
-		/etc/init.d/haveged start
-		secret=`fastd --generate-key --machine-readable`
-		/etc/init.d/haveged stop
-uci -q batch <<EOF
-set fastd.$s.secret=$secret
-commit fastd
-EOF
+		error "$s: secret is not set" 
+		return 1
 	fi
 
 	append_opts_list "$s" config config_peer_dir bind method
