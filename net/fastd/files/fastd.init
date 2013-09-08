@@ -124,7 +124,7 @@ generate_peer_config() {
 	config_get port "$peer" port
 
 	if [ "$address" -o "$hostname" ]; then
-		if [ "$port" ]; then
+		if [ -z "$port" ]; then
 			error "peer $peer: address or hostname, but no port given"
 			return 1
 		fi
